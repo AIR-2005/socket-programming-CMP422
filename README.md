@@ -86,6 +86,10 @@ Diğer işlemler ve hatalar strict log formatını değiştirmeyen ayrı dosyala
 - `client-USERNAME-detailed.log`: bağlantı/kayıt, userlist, commands, teklifler, kabul/ret,
   başarılı işlemler, hatalar ve kapanış. Bu kayıtlarda timestamp ve log level de bulunur.
 
+Server her başladığında terminale ve `server-detailed.log` dosyasına tarih/saat ve port
+içeren `=== Server started | ... ===` satırı eklenir. Mevcut logların sonuna yazılmaya
+devam edilir; yeni klasör oluşturulmaz. Strict `server.log` dosyasına bu ayraç eklenmez.
+
 Log filename'inde path ayırıcıları gibi karakterler `_` ile değiştirilir. Logs, `download/`,
 Python cache ve local ayarlar `.gitignore` ile Git dışında tutulur.
 

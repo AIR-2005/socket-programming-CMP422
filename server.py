@@ -2,6 +2,7 @@
 
 import argparse
 from dataclasses import dataclass, field
+from datetime import datetime
 import ipaddress
 import logging
 import queue
@@ -160,6 +161,10 @@ class DirectoryServer:
             listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listening_socket.bind(("0.0.0.0", port))
             listening_socket.listen()
+            logging.info(
+                "=== Server started | %s | port=%s ===",
+                datetime.now().astimezone().isoformat(timespec="seconds"), port,
+            )
 
             try:
                 while True:
