@@ -38,6 +38,22 @@ address'ini yazın. Linux'ta adresleri `hostname -I` ile görebilirsiniz.
 python3 client 192.168.1.10 5000 Ayse
 ```
 
+**IP address'e dikkat:** Hotspot, eduroam veya başka bir network'e geçtiğinizde server
+bilgisayarının IP address'i değişebilir. Her testten önce server bilgisayarında güncel
+Wi-Fi IPv4 address'ini kontrol edip takım arkadaşlarınızla paylaşın. Linux'ta `hostname -I`
+birden fazla adres gösterirse Docker, VPN ve diğer interface adreslerini karıştırmayın;
+Wi-Fi interface adresini `ip -4 addr show` ile ayırt edin.
+
+Client komutuna client'ın kendi IP address'i değil, **server bilgisayarının güncel IP
+address'i** yazılmalıdır. `127.0.0.1` yalnızca server ve client aynı bilgisayardaysa
+kullanılır. README'deki IP address'ler örnektir; önceki hotspot IP address'ini eduroam'da
+aynen kullanmayın. Port da server'ın başlatıldığı port ile aynı olmalıdır.
+
+Ping'in başarılı olması TCP erişiminin açık olduğunu garanti etmez. Önce client'ların
+server'a bağlanıp userlist aldığını, ardından peer'ların birbirine message ve file
+gönderebildiğini kontrol edin. Yalnızca server'ın `5000` port'una erişmek P2P için yeterli
+değildir; client'ların P2P listening port'ları arasında da TCP erişimi gerekir.
+
 Her client farklı username kullanmalıdır. Parametre sırası:
 `python3 client <server-ip-address> <server-port-number> <user-name>`.
 `client.py` ve `server.py` dosyaları da doğrudan çalıştırılabilir.
