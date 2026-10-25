@@ -29,7 +29,10 @@ def validate_peer_information(peer: dict) -> None:
 
 
 class PeerMessenger:
-    def __init__(self, username: str, events: queue.Queue, stopped: threading.Event) -> None:
+    def __init__(
+        self, username: str, events: queue.Queue, stopped: threading.Event,
+        working_directory: Path | None = None,
+    ) -> None:
         self.username = username
         self.events = events
         self.stopped = stopped
@@ -37,20 +40,43 @@ class PeerMessenger:
         self.outgoing_messages = queue.Queue()
         self.connection_lock = threading.Lock()
         self.active_connections: set[socket.socket] = set()
-        self.download_directory = Path.cwd() / "download"
+        working_directory = Path(working_directory or Path.cwd())
+        working_directory.mkdir(parents=True, exist_ok=True)
+        self.download_directory = working_directory / "download"
+        self.logs_closed = False
 
         # Each process has its own log. FileHandler serializes writes from threads.
         safe_username = re.sub(r"[^\w.-]", "_", username)
         self.log_handler = logging.FileHandler(
-            f"client-{safe_username}.log", encoding="utf-8", delay=True
+            working_directory / f"client-{safe_username}.log", encoding="utf-8", delay=True
         )
         self.log_handler.setFormatter(logging.Formatter("%(message)s"))
         self.logger = logging.Logger(f"peer.{username}", level=logging.INFO)
         self.logger.addHandler(self.log_handler)
+        self.detailed_handler = logging.FileHandler(
+            working_directory / f"client-{safe_username}-detailed.log",
+            encoding="utf-8", delay=True,
+        )
+        self.detailed_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        self.activity_logger = logging.Logger(f"peer.{username}.activity", level=logging.INFO)
+        self.activity_logger.addHandler(self.detailed_handler)
+
+    def report_activity(
+        self, text: str, level: int = logging.INFO, notify: bool = True
+    ) -> None:
+        with self.connection_lock:
+            if self.logs_closed:
+                return
+            self.activity_logger.log(level, "%s: %s", self.username, text)
+            if notify and not self.stopped.is_set():
+                self.events.put(("info", text))
 
     def start(self, listening_socket: socket.socket) -> None:
         local_ip, local_port = listening_socket.getsockname()
         self.identity = {"username": self.username, "ip": local_ip, "port": local_port}
+        self.report_activity(f"P2P listener ready at {local_ip}:{local_port}", notify=False)
         listening_socket.settimeout(0.2)
         threading.Thread(
             target=self.accept_connections, args=(listening_socket,), daemon=True
@@ -101,20 +127,26 @@ class PeerMessenger:
                     send_packet(connection_socket, {"type": "message_received"})
             elif packet.get("type") == "file_offer":
                 offer = parse_file_offer(packet, sender)
+                self.report_activity(
+                    f"File offered by {sender['username']}: {offer.filename} ({offer.size} bytes)",
+                    notify=False,
+                )
                 self.events.put(("file_offer", offer))
                 destination = receive_file_bytes(
-                    connection_socket, offer, self.download_directory, self.stopped
+                    connection_socket, offer, self.download_directory, self.stopped,
+                    on_decision=lambda accepted: self.report_activity(
+                        f"{'Accepted' if accepted else 'Rejected'} {offer.filename} "
+                        f"from {sender['username']}.", notify=not accepted,
+                    ),
                 )
                 if destination is not None:
                     if self.record_file("from", sender, offer.filename, destination):
                         send_packet(connection_socket, {"type": "file_received"})
-                elif not self.stopped.is_set():
-                    self.events.put(("info", f"Rejected {offer.filename} from {sender['username']}."))
             else:
                 raise ValueError("Expected a message or file_offer packet.")
         except (OSError, ValueError) as error:
             if not self.stopped.is_set():
-                self.events.put(("info", f"Incoming transfer error: {error}"))
+                self.report_activity(f"Incoming transfer error: {error}", logging.ERROR)
         finally:
             self.release_connection(connection_socket)
 
@@ -126,12 +158,14 @@ class PeerMessenger:
             raise ConnectionError("Client is disconnected.")
         # Capture the target now, even if the GUI selection or userlist later changes.
         self.outgoing_messages.put((dict(recipient), content))
+        self.report_activity(f"Message queued to {recipient['username']}", notify=False)
 
     def queue_file(self, recipient: dict, path_text: str) -> None:
         validate_peer_information(recipient)
         file_path = validate_file_path(path_text)
         if self.stopped.is_set() or self.identity is None:
             raise ConnectionError("Client is disconnected.")
+        self.report_activity(f"File queued to {recipient['username']}: {file_path.name}", notify=False)
         # A file upload never occupies the ordered message-sending worker.
         threading.Thread(
             target=self.send_file, args=(dict(recipient), file_path), daemon=True
@@ -151,6 +185,10 @@ class PeerMessenger:
                             "type": "file_offer", "sender": self.identity,
                             "filename": file_path.name, "size": file_size,
                         })
+                        self.report_activity(
+                            f"File offered to {recipient['username']}: {file_path.name} ({file_size} bytes)",
+                            notify=False,
+                        )
                         # Human confirmation has no five-second network deadline.
                         # Disconnect still interrupts this recv through shutdown().
                         connection_socket.settimeout(None)
@@ -162,15 +200,13 @@ class PeerMessenger:
                             raise ConnectionError("No valid file acceptance response.")
                         if not decision["accepted"]:
                             if not self.stopped.is_set():
-                                self.events.put(("info", (
+                                self.report_activity(
                                     f"{recipient['username']} rejected {file_path.name}."
-                                )))
+                                )
                             return
 
                         connection_socket.settimeout(TRANSFER_TIMEOUT)
-                        self.events.put(("info", (
-                            f"Sending {file_path.name} to {recipient['username']}…"
-                        )))
+                        self.report_activity(f"Sending {file_path.name} to {recipient['username']}…")
                         send_file_bytes(connection_socket, source, file_size, self.stopped)
                         confirmation = receive_packet(connection_socket)
                         if confirmation != {"type": "file_received"}:
@@ -180,9 +216,10 @@ class PeerMessenger:
                         self.release_connection(connection_socket)
         except (OSError, ValueError) as error:
             if not self.stopped.is_set():
-                self.events.put(("info", (
-                    f"File transfer to {recipient['username']} could not be confirmed: {error}"
-                )))
+                self.report_activity(
+                    f"File transfer to {recipient['username']} could not be confirmed: {error}",
+                    logging.ERROR,
+                )
 
     def send_queued_messages(self) -> None:
         # One worker preserves command order while the GUI and receiver stay active.
@@ -212,9 +249,10 @@ class PeerMessenger:
                         self.release_connection(connection_socket)
             except (OSError, ValueError) as error:
                 if not self.stopped.is_set():
-                    self.events.put(("info", (
-                        f"Delivery to {recipient['username']} could not be confirmed: {error}"
-                    )))
+                    self.report_activity(
+                        f"Delivery to {recipient['username']} could not be confirmed: {error}",
+                        logging.ERROR,
+                    )
             finally:
                 self.outgoing_messages.task_done()
 
@@ -223,6 +261,10 @@ class PeerMessenger:
             if self.stopped.is_set():
                 return False
             self.logger.info(
+                "Message %s %s@%s:%s “%s”",
+                direction, peer["username"], peer["ip"], peer["port"], content,
+            )
+            self.activity_logger.info(
                 "Message %s %s@%s:%s “%s”",
                 direction, peer["username"], peer["ip"], peer["port"], content,
             )
@@ -241,6 +283,10 @@ class PeerMessenger:
                 "%s %s %s@%s:%s", filename, direction,
                 peer["username"], peer["ip"], peer["port"],
             )
+            self.activity_logger.info(
+                "%s %s %s@%s:%s", filename, direction,
+                peer["username"], peer["ip"], peer["port"],
+            )
             self.events.put(("file", {
                 "direction": direction, "peer": dict(peer), "filename": filename,
                 "destination": str(destination) if destination is not None else None,
@@ -252,7 +298,11 @@ class PeerMessenger:
         with self.connection_lock:
             connections = list(self.active_connections)
             self.active_connections.clear()
+            if not self.logs_closed:
+                self.activity_logger.info("%s: Client stopped", self.username)
+                self.logs_closed = True
             self.log_handler.close()
+            self.detailed_handler.close()
         for connection in connections:
             try:
                 connection.shutdown(socket.SHUT_RDWR)

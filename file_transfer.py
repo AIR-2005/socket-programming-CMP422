@@ -5,7 +5,7 @@ from pathlib import Path
 import queue
 import socket
 import threading
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from protocol import send_packet
 
@@ -78,6 +78,7 @@ def create_download(download_directory: Path, filename: str) -> tuple[Path, Bina
 def receive_file_bytes(
     connection_socket: socket.socket, offer: FileOffer, download_directory: Path,
     stopped: threading.Event,
+    on_decision: Callable[[bool], None] | None = None,
 ) -> Path | None:
     # The network worker waits here; the GUI decides through offer.decision.
     while not stopped.is_set():
@@ -89,6 +90,8 @@ def receive_file_bytes(
     else:
         raise ConnectionError("File transfer was cancelled before acceptance.")
 
+    if on_decision is not None:
+        on_decision(accepted)
     if not accepted:
         send_packet(connection_socket, {"type": "file_decision", "accepted": False})
         return None

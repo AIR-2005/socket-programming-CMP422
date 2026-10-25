@@ -1,9 +1,10 @@
 """Central peer directory: register peers and broadcast the online userlist."""
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ipaddress
 import logging
+import queue
 import socket
 import sys
 import threading
@@ -17,16 +18,24 @@ class Peer:
     ip: str
     port: int
     connection_socket: socket.socket
+    pending_userlists: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=1))
+    stopped: threading.Event = field(default_factory=threading.Event)
+    writer_thread: threading.Thread | None = None
 
     def public_information(self) -> dict:
         return {"username": self.username, "ip": self.ip, "port": self.port}
+
+
+class AssignmentEventFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return getattr(record, "assignment_event", False)
 
 
 class DirectoryServer:
     def __init__(self) -> None:
         self.peers: dict[str, Peer] = {}
         self.registry_lock = threading.Lock()
-        # One broadcast at a time prevents overlapping frames and stale snapshots.
+        # Serialize snapshots, but let each peer's writer perform its own network I/O.
         self.broadcast_lock = threading.Lock()
 
     def broadcast_userlist(self) -> None:
@@ -38,16 +47,43 @@ class DirectoryServer:
                 "type": "userlist",
                 "users": [peer.public_information() for peer in online_peers],
             }
-            # Network I/O happens after releasing the registry lock.
             for peer in online_peers:
+                if peer.stopped.is_set():
+                    continue
                 try:
-                    send_packet(peer.connection_socket, packet)
-                except OSError:
-                    # Wake the receiving thread so its finally block removes this peer.
+                    peer.pending_userlists.put_nowait(packet)
+                except queue.Full:
+                    # A full snapshot supersedes an older snapshot, so retain only the latest.
                     try:
-                        peer.connection_socket.shutdown(socket.SHUT_RDWR)
-                    except OSError:
+                        peer.pending_userlists.get_nowait()
+                        peer.pending_userlists.task_done()
+                    except queue.Empty:
                         pass
+                    peer.pending_userlists.put_nowait(packet)
+            logging.info("Userlist queued for %s peer(s)", len(online_peers))
+
+    def send_userlists(self, peer: Peer) -> None:
+        while not peer.stopped.is_set():
+            try:
+                packet = peer.pending_userlists.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                send_packet(peer.connection_socket, packet)
+            except (OSError, ValueError) as error:
+                if not peer.stopped.is_set():
+                    logging.warning(
+                        "Userlist delivery failed: %s", error,
+                        extra={"username": peer.username},
+                    )
+                peer.stopped.set()
+                try:
+                    peer.connection_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+            finally:
+                peer.pending_userlists.task_done()
 
     def handle_connection(self, connection_socket: socket.socket) -> None:
         registered_peer = None
@@ -78,9 +114,11 @@ class DirectoryServer:
                 registered_peer = peer
                 logging.info(
                     "%s %s connected", peer.ip, peer.port,
-                    extra={"username": peer.username},
+                    extra={"username": peer.username, "assignment_event": True},
                 )
 
+            peer.writer_thread = threading.Thread(target=self.send_userlists, args=(peer,))
+            peer.writer_thread.start()
             self.broadcast_userlist()
 
             # Keep the directory connection open to detect the peer leaving.
@@ -92,17 +130,27 @@ class DirectoryServer:
                 raise ValueError("Only disconnect is accepted after registration.")
 
         except (OSError, ValueError) as error:
-            print(f"Connection error: {error}", file=sys.stderr)
+            logging.error(
+                "Connection error: %s", error,
+                extra={"username": registered_peer.username if registered_peer else "-"},
+            )
         finally:
             if registered_peer is not None:
                 with self.registry_lock:
                     del self.peers[registered_peer.username]
                     logging.info(
                         "%s %s disconnected", registered_peer.ip, registered_peer.port,
-                        extra={"username": registered_peer.username},
+                        extra={"username": registered_peer.username, "assignment_event": True},
                     )
+                registered_peer.stopped.set()
+            try:
+                connection_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             connection_socket.close()
             if registered_peer is not None:
+                if registered_peer.writer_thread is not None:
+                    registered_peer.writer_thread.join()
                 self.broadcast_userlist()
 
     def run(self, port: int) -> None:
@@ -150,8 +198,9 @@ def main() -> None:
     # Keep the assignment's strict format while also recording who owns each endpoint.
     assignment_log = logging.FileHandler("server.log", encoding="utf-8")
     assignment_log.setFormatter(logging.Formatter("%(message)s"))
+    assignment_log.addFilter(AssignmentEventFilter())
 
-    detailed_format = logging.Formatter("%(username)s %(message)s")
+    detailed_format = logging.Formatter("%(username)s %(message)s", defaults={"username": "server"})
     detailed_log = logging.FileHandler("server-detailed.log", encoding="utf-8")
     detailed_log.setFormatter(detailed_format)
     console_log = logging.StreamHandler(sys.stdout)

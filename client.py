@@ -2,6 +2,8 @@
 
 import argparse
 import errno
+import logging
+from pathlib import Path
 import queue
 import random
 import socket
@@ -12,6 +14,27 @@ from tkinter import messagebox, ttk
 from file_transfer import validate_file_path
 from messaging import PeerMessenger, validate_peer_information
 from protocol import receive_packet, send_packet
+
+
+class ConversationHistory:
+    """Keep each peer's conversation and unread count independently of Tk widgets."""
+
+    def __init__(self) -> None:
+        self.active_peer: str | None = None
+        self.history: dict[str, list[str]] = {}
+        self.unread: dict[str, int] = {}
+
+    def select(self, username: str) -> None:
+        self.active_peer = username
+        self.unread[username] = 0
+
+    def add(self, username: str, text: str, incoming: bool = False) -> None:
+        self.history.setdefault(username, []).append(text)
+        if incoming and username != self.active_peer:
+            self.unread[username] = self.unread.get(username, 0) + 1
+
+    def visible_lines(self) -> list[str]:
+        return list(self.history.get(self.active_peer, []))
 
 
 def parse_commands(command_text: str) -> list[tuple[str, str]]:
@@ -65,17 +88,20 @@ def create_peer_listener(local_ip: str) -> socket.socket:
 class DirectoryConnection:
     """Network state is separate from the GUI; workers report events via a queue."""
 
-    def __init__(self, username: str, events: queue.Queue) -> None:
+    def __init__(
+        self, username: str, events: queue.Queue, working_directory: Path | None = None
+    ) -> None:
         self.username = username
         self.events = events
         self.stopped = threading.Event()
         self.socket_lock = threading.Lock()
         self.server_socket: socket.socket | None = None
         self.listening_socket: socket.socket | None = None
-        self.messenger = PeerMessenger(username, events, self.stopped)
+        self.messenger = PeerMessenger(username, events, self.stopped, working_directory)
 
     def connect_and_receive(self, server_ip: str, server_port: int) -> None:
         try:
+            self.messenger.report_activity(f"Connecting to server {server_ip}:{server_port}", notify=False)
             with socket.create_connection(
                 (server_ip, server_port), timeout=5
             ) as server_socket:
@@ -95,13 +121,14 @@ class DirectoryConnection:
                         "ip": local_ip,
                         "port": listening_socket.getsockname()[1],
                     })
+                    self.messenger.report_activity("Registration sent to server", notify=False)
                     # An idle directory connection is normal, not a five-second failure.
                     server_socket.settimeout(None)
 
                     while not self.stopped.is_set():
                         packet = receive_packet(server_socket)
                         if packet is None:
-                            self.events.put(("info", "Server closed the connection."))
+                            self.messenger.report_activity("Server closed the connection.", logging.WARNING)
                             break
                         if packet.get("type") != "userlist":
                             raise ValueError("Expected a userlist packet from the server.")
@@ -110,10 +137,13 @@ class DirectoryConnection:
                             raise ValueError("The userlist must be a list.")
                         for user in users:
                             validate_peer_information(user)
+                        self.messenger.report_activity(
+                            f"Userlist received: {len(users)} peer(s)", notify=False
+                        )
                         self.events.put(("userlist", users))
         except (OSError, ValueError) as error:
             if not self.stopped.is_set():
-                self.events.put(("info", f"Connection error: {error}"))
+                self.messenger.report_activity(f"Connection error: {error}", logging.ERROR)
         finally:
             self.close()
             self.events.put(("disconnected", None))
@@ -141,41 +171,48 @@ class ClientWindow:
         self.root = root
         self.username = username
         self.online_users: dict[str, dict] = {}
+        self.displayed_users: list[str] = []
+        self.conversations = ConversationHistory()
         self.events = queue.Queue()
         self.file_offers = queue.Queue()
         self.file_dialog_open = False
         self.connection = DirectoryConnection(username, self.events)
 
         root.title(f"Peer — {username}")
-        root.geometry("760x500")
-        root.minsize(560, 380)
+        root.geometry("800x550")
+        root.minsize(600, 420)
         root.protocol("WM_DELETE_WINDOW", self.close_window)
 
         frame = ttk.Frame(root, padding=12)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(1, weight=1)
+        frame.rowconfigure(2, weight=1)
 
         self.status = tk.StringVar(value=f"Connecting to {server_ip}:{server_port}…")
         ttk.Label(frame, textvariable=self.status).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
         )
+        self.conversation_title = tk.StringVar(value="Select a user to start a conversation")
+        ttk.Label(frame, textvariable=self.conversation_title).grid(
+            row=1, column=0, sticky="w", pady=(0, 4)
+        )
         self.output = tk.Text(frame, width=48, height=12, state="disabled", wrap="word")
-        self.output.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+        self.output.grid(row=2, column=0, sticky="nsew", padx=(0, 12))
 
         users_frame = ttk.LabelFrame(frame, text="Online users", padding=6)
-        users_frame.grid(row=1, column=1, sticky="nsew")
+        users_frame.grid(row=1, column=1, rowspan=2, sticky="nsew")
         self.user_list = tk.Listbox(users_frame, width=20, exportselection=False)
         self.user_list.pack(fill="both", expand=True)
+        self.user_list.bind("<<ListboxSelect>>", self.select_conversation)
 
         ttk.Label(frame, text="Commands").grid(
-            row=2, column=0, sticky="w", pady=(10, 4)
+            row=3, column=0, sticky="w", pady=(10, 4)
         )
         self.command_area = tk.Text(frame, height=5, width=48, wrap="word")
-        self.command_area.grid(row=3, column=0, sticky="nsew", padx=(0, 12))
+        self.command_area.grid(row=4, column=0, sticky="nsew", padx=(0, 12))
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=3, column=1, sticky="nsew")
+        buttons.grid(row=4, column=1, sticky="nsew")
         self.execute_button = ttk.Button(
             buttons, text="Execute", command=self.execute_commands, state="disabled"
         )
@@ -184,6 +221,10 @@ class ClientWindow:
             buttons, text="Disconnect", command=self.connection.close
         )
         self.disconnect_button.pack(fill="x")
+        self.activity_status = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.activity_status, wraplength=720).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
 
         # Tk stays on the main thread; all blocking network reads use this worker.
         self.worker = threading.Thread(
@@ -195,17 +236,60 @@ class ClientWindow:
         root.after(100, self.process_events)
 
     def append_output(self, text: str) -> None:
+        """Show system feedback outside the selected peer's conversation."""
+        self.activity_status.set(text)
+
+    def render_conversation(self) -> None:
+        username = self.conversations.active_peer
+        title = f"Conversation with {username}" if username else "Select a user to start a conversation"
+        if username and username not in self.online_users:
+            title += " (offline)"
+        self.conversation_title.set(title)
         self.output.configure(state="normal")
-        self.output.insert("end", text + "\n")
+        self.output.delete("1.0", "end")
+        lines = self.conversations.visible_lines()
+        if lines:
+            self.output.insert("end", "\n".join(lines) + "\n")
         self.output.see("end")
         self.output.configure(state="disabled")
+
+    def refresh_user_list(self) -> None:
+        self.displayed_users = sorted(self.online_users)
+        self.user_list.delete(0, "end")
+        for index, username in enumerate(self.displayed_users):
+            unread = self.conversations.unread.get(username, 0)
+            label = f"{username} ({unread} unread)" if unread else username
+            self.user_list.insert("end", label)
+            if username == self.conversations.active_peer:
+                self.user_list.selection_set(index)
+
+    def select_conversation(self, event=None) -> None:
+        selected = self.user_list.curselection()
+        if not selected:
+            return
+        username = self.displayed_users[selected[0]]
+        if username == self.conversations.active_peer and not self.conversations.unread.get(username):
+            return
+        self.conversations.select(username)
+        self.refresh_user_list()
+        self.render_conversation()
+
+    def add_conversation(self, username: str, text: str, incoming: bool = False) -> None:
+        if self.conversations.active_peer is None:
+            self.conversations.select(username)
+        self.conversations.add(username, text, incoming)
+        if incoming and username != self.conversations.active_peer:
+            self.append_output(f"New activity from {username}")
+        self.refresh_user_list()
+        self.render_conversation()
 
     def execute_commands(self) -> None:
         selected = self.user_list.curselection()
         if not selected:
             self.append_output("Select a recipient from Online users first.")
+            self.connection.messenger.report_activity("Command rejected: no recipient selected", notify=False)
             return
-        recipient = self.online_users[self.user_list.get(selected[0])]
+        recipient = self.online_users[self.displayed_users[selected[0]]]
         try:
             commands = parse_commands(self.command_area.get("1.0", "end-1c"))
             for command, argument in commands:
@@ -215,6 +299,7 @@ class ClientWindow:
                     self.connection.messenger.queue_file(recipient, argument)
         except (OSError, ValueError) as error:
             self.append_output(str(error))
+            self.connection.messenger.report_activity(f"Command error: {error}", logging.ERROR, notify=False)
             return
         self.command_area.delete("1.0", "end")
 
@@ -239,7 +324,7 @@ class ClientWindow:
             pass
         finally:
             if accepted and not self.connection.stopped.is_set():
-                self.append_output(
+                self.add_conversation(offer.sender["username"],
                     f"Accepted {offer.filename} from {offer.sender['username']}."
                 )
             offer.decision.put(accepted)
@@ -253,17 +338,12 @@ class ClientWindow:
                 break
 
             if event_type == "userlist":
-                selected = self.user_list.curselection()
-                selected_username = self.user_list.get(selected[0]) if selected else None
                 self.online_users = {
                     user["username"]: user for user in data
                     if user["username"] != self.username
                 }
-                self.user_list.delete(0, "end")
-                for index, username in enumerate(sorted(self.online_users)):
-                    self.user_list.insert("end", username)
-                    if username == selected_username:
-                        self.user_list.selection_set(index)
+                self.refresh_user_list()
+                self.render_conversation()
                 self.status.set(f"Connected as {self.username}")
                 self.execute_button.state(["!disabled"])
                 self.append_output(
@@ -277,21 +357,26 @@ class ClientWindow:
                     label = f"{self.username} → {peer_username}"
                 else:
                     label = f"{peer_username} → {self.username}"
-                self.append_output(f"{label}: {data['content']}")
+                self.add_conversation(
+                    peer_username, f"{label}: {data['content']}", data["direction"] == "from"
+                )
             elif event_type == "file_offer":
                 self.file_offers.put(data)
             elif event_type == "file":
                 peer_username = data["peer"]["username"]
                 if data["direction"] == "from":
-                    self.append_output(
-                        f"Received {data['filename']} from {peer_username}: {data['destination']}"
+                    self.add_conversation(
+                        peer_username,
+                        f"Received {data['filename']} from {peer_username}: {data['destination']}",
+                        incoming=True,
                     )
                 else:
-                    self.append_output(f"Sent {data['filename']} to {peer_username}.")
+                    self.add_conversation(peer_username, f"Sent {data['filename']} to {peer_username}.")
             elif event_type == "disconnected":
                 self.status.set("Disconnected")
                 self.online_users.clear()
-                self.user_list.delete(0, "end")
+                self.refresh_user_list()
+                self.render_conversation()
                 self.disconnect_button.state(["disabled"])
                 self.execute_button.state(["disabled"])
 

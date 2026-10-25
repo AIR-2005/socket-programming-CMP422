@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Run the GUI client using the command format in the homework PDF."""
+
+from client import main
+
+
+if __name__ == "__main__":
+    main()
