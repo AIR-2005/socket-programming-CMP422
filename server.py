@@ -7,7 +7,7 @@ import sys
 class Server:
     def __init__(self, port):
         self.user_dict = {}
-        self.server_ip = ""
+        self.server_ip = socket.gethostbyname(socket.gethostname())
         self.server_port = int(port)
         self.listener_socket = None
         self.log_file_name = "server.log"
