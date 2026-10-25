@@ -4,6 +4,7 @@ import json
 import tkinter as tk
 from tkinter import messagebox
 import sys
+import os
 
 class Client:
     def __init__(self, server_ip, server_port, username):
@@ -94,6 +95,11 @@ class Client:
                     target=self.sender, args=(target_username, cmd_line), daemon=True
                 ).start()
 
+    # Write log function
+    def write_log(self, log_text):
+        with open(self.log_file_name, "a", encoding="utf-8") as f:
+            f.write(log_text + "\n")
+
     # Start
     def start(self):
         # Create Listener Socket for client
@@ -122,12 +128,12 @@ class Client:
     # Server Connector
     def server_connect(self):
         self.reader = self.server_socket.makefile("r", encoding="utf-8")
-        for line in reader:
-            msg = json.loads(line)
-            if msg.get("type") == "userlist":
+        for line in self.reader:
+            server_msg = json.loads(line)
+            if server_msg.get("type") == "userlist":
                 # Convert [{"username": u, "ip": ip, "port": p}, ...] -> {u: (ip, p)}
                 self.user_dict = {
-                    u["username"]: (u["ip"], u["port"]) for u in msg["users"]
+                    u["username"]: (u["ip"], u["port"]) for u in server_msg["users"]
                 }
                 print(self.user_dict)
                 self.root.after(0, self.update_user_list)
@@ -135,18 +141,57 @@ class Client:
     # Client Listener
     def client_listener(self):
         while True:
+            # Accept Connection
             connection, addr = self.listener_socket.accept()
             data = connection.recv(4096).decode()
             if data:
-                msg = json.loads(data)
-                if msg["type"] == "msg":
-                    sender = msg["username"]
-                    content = msg["content"]
+                msg_info = json.loads(data)
+                if msg_info["type"] == "msg":
+                    sender = msg_info["username"]
+                    content = msg_info["content"]
                     sender_ip, sender_port = self.user_dict[sender]
 
                     # Print to GUI output area and log file
                     self.root.after(0, self.write_output, f"{sender} > {content}")
-                    #self.write_log(f'Message from {sender}@{sender_ip}:{sender_port} "{content}"')
+                    self.write_log(f'Message from {sender}@{sender_ip}:{sender_port} "{content}"')
+                elif msg_info["type"] == "file":
+                    # Get file name and size, sender username
+                    file_name = msg_info["fileName"]
+                    file_size = msg_info["fileSize"]
+                    sender = msg_info["username"]
+                    sender_ip, sender_port = self.user_dict[sender]
+                    # Create threading event to wait and get user response for download
+                    confirm_event = threading.Event()
+                    decision = {"accepted": False}
+                    # Helper function to get user response
+                    def ask_confirmation():
+                        decision["accepted"] = messagebox.askyesno(
+                            "File Transfer",
+                            f"Do you want to accept '{file_name}' ({file_size} bytes) from {sender}?"
+                        )
+                        confirm_event.set()
+                    # Run ask_conformation and wait for the response
+                    self.root.after(0, ask_confirmation)
+                    confirm_event.wait()
+                    # Decision
+                    if decision["accepted"]:
+                        # Send accept to sender to start file transfer
+                        connection.sendall("accept".encode())
+                        # Create download path if it doesn't exist and create save path for downloaded file
+                        os.makedirs("download", exist_ok=True)
+                        save_path = os.path.join("download", file_name)
+                        # Receive file as chunks
+                        received = 0
+                        with open(save_path, "wb") as file:
+                            while received < file_size:
+                                chunk = connection.recv(4096)
+                                if not chunk:
+                                    break
+                                file.write(chunk)
+                                received += len(chunk)
+                        # Print file reiceved message and write log
+                        self.root.after(0, self.write_output, f"{self.username} > file accepted")
+                        self.write_log(f"{file_name} from {sender}@{sender_ip}:{sender_port}")
             connection.close()
 
     # Sender
@@ -158,6 +203,7 @@ class Client:
         send_socket.connect((send_ip, send_port))
         cmd_type, cmd_content = cmd.split(" ", 1)
         if cmd_type == "sndmsg":
+            # Send message info and content
             send_socket.sendall(json.dumps({
                 "type": "msg",
                 "username": self.username,
@@ -165,17 +211,47 @@ class Client:
             }).encode())
             # Print outgoing message to GUI and write to log
             self.root.after(0, self.write_output, f"{self.username} > {cmd_content}")
-            #self.write_log(f'Message to {username}@{send_ip}:{send_port} "{cmd_content}"')
+            self.write_log(f'Message to {username}@{send_ip}:{send_port} "{cmd_content}"')
         elif cmd_type == "sndf":
-            pass #We are cooked
+            # Clean the path file
+            file_path = cmd_content.strip().strip('"')
+            # If file is not in file path
+            if not os.path.isfile(file_path):
+                self.root.after(0, self.write_output, f"File not found: {file_path}")
+                send_socket.close()
+                return
+            # Get file name and size
+            file_name = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+
+            # Send file info and size
+            send_socket.sendall(json.dumps({
+                "type": "file",
+                "username": self.username,
+                "fileName": file_name,
+                "fileSize": file_size
+            }).encode())
+            self.root.after(0, self.write_output, f"{self.username} > file sent {cmd_content}")
+            # Wait response from receiver
+            response = send_socket.recv(1024).decode()
+            # If file transfer is accepted
+            if response == "accept":
+                self.root.after(0, self.write_output, f"{username} > file accepted")
+                # Read file as chunks and send it
+                with open(file_path, "rb") as file:
+                    while True:
+                        chunk = file.read(4096)
+                        if not chunk:
+                            break
+                        send_socket.sendall(chunk)
+                # Write to log
+                self.write_log(f"{file_name} to {username}@{send_ip}:{send_port}")
         else:
             pass #NOPE
         send_socket.close()
 
    # Disconnect
     def disconnect(self):
-        # Close reader  
-        self.reader.close()
         # Close listener and server sockets
         self.server_socket.close()
         self.listener_socket.close()
@@ -184,9 +260,10 @@ class Client:
 
 # Run client
 if __name__ == "__main__":
-    # Command format: python client.py <server-ip-address> <server-port-number> <user-name>
     if len(sys.argv) == 4:
         client = Client(sys.argv[1], sys.argv[2], sys.argv[3])
         client.start()
+    else:
+            print("Usage: python client.py <server-ip-address> <server-port-number> <user-name>")
 
 

@@ -5,13 +5,16 @@ import json
 import sys
 
 class Server:
-    def __init__(self):
+    def __init__(self, port):
         self.user_dict = {}
-        self.server_ip = "192.168.156.163"
-        self.server_port = 8000
-
+        self.server_ip = ""
+        self.server_port = int(port)
         self.listener_socket = None
+        self.log_file_name = "server.log"
 
+    def write_log(self, log_text):
+        with open(self.log_file_name, "a", encoding="utf-8") as f:
+                f.write(log_text + "\n")
 
     def send_userlist(self):
         users = [{"username": u, "ip": ip, "port": p} for u, (ip, p, _) in self.user_dict.items()]
@@ -24,7 +27,6 @@ class Server:
 
     def handle_client(self, connection):
         username = None
-
         reader = connection.makefile("r", encoding="utf-8")
         
         for line in reader:                   
@@ -34,10 +36,12 @@ class Server:
                 ip, port = user_info["ip"], user_info["port"]
                 
                 self.user_dict[username] = (ip, port, connection)
+                self.write_log(f"{ip} {port} connected")
                 self.send_userlist()
 
         if username is not None:
             ip, port, _ = self.user_dict.pop(username)
+            self.write_log(f"{ip} {port} disconnected")
             self.send_userlist()
         
         connection.close()
@@ -58,4 +62,7 @@ class Server:
         
 
 if __name__ == "__main__":
-    Server().listener()
+    if len(sys.argv) == 2:
+        Server(sys.argv[1]).listener()
+    else:
+        print("Usage: python server.py <server-port-number>")
