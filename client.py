@@ -1,192 +1,324 @@
+"""Discover online peers and exchange messages and files through a Tk GUI."""
+
+import argparse
+import errno
+import queue
+import random
 import socket
 import threading
-import json
 import tkinter as tk
-from tkinter import messagebox
-import sys
+from tkinter import messagebox, ttk
 
-class Client:
-    def __init__(self, server_ip, server_port, username):
-        # Get server ip, server port and user name from command line
-        self.server_ip = server_ip
-        self.server_port = int(server_port)
-        self.username = username
+from file_transfer import validate_file_path
+from messaging import PeerMessenger, validate_peer_information
+from protocol import receive_packet, send_packet
 
-        self.user_ip = None
-        self.listen_port = None
-        self.listener_socket = None
-        self.server_socket = None
-        self.user_dict = {}
 
-        # Log file
-        self.log_file_name = f"{self.username}.log"
+def parse_commands(command_text: str) -> list[tuple[str, str]]:
+    """Read one command per line, preserving message text and spaces in file paths."""
+    commands = []
+    for line_number, line in enumerate(command_text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        parts = line.split(maxsplit=1)
+        command = parts[0]
+        if command not in ("sndmsg", "sndf"):
+            raise ValueError(f"Line {line_number}: unknown command '{parts[0]}'.")
+        if len(parts) != 2 or not parts[1].strip():
+            raise ValueError(f"Line {line_number}: {command} requires an argument.")
+        argument = parts[1]
+        if command == "sndf":
+            argument = argument.strip()
+            quote_pairs = {'"': '"', "'": "'", '“': '”'}
+            if argument[0] in quote_pairs:
+                if len(argument) < 2 or argument[-1] != quote_pairs[argument[0]]:
+                    raise ValueError(f"Line {line_number}: file path has an unmatched quote.")
+                argument = argument[1:-1]
+            argument = str(validate_file_path(argument))
+        commands.append((command, argument))
+    if not commands:
+        raise ValueError("Enter sndmsg <message> or sndf <full-file-path>.")
+    return commands
 
-        # Initialize root
-        self.root = tk.Tk()
-        self.root.title(self.username)
-        self.root.geometry("1280x720")
-        self.root.protocol("WM_DELETE_WINDOW", self.disconnect)
-        self.init_gui()
 
-    # Initialize GUI
-    def init_gui(self):
-        # Left side: Output Area (top) + Command Input Area (bottom)
-        left_frame = tk.Frame(self.root)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        self.output_area = tk.Text(left_frame, height=15, state=tk.DISABLED)
-        self.output_area.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-        self.cmd_area = tk.Text(left_frame, height=6)
-        self.cmd_area.pack(fill=tk.BOTH, expand=False)
-
-        # Right side: Users Listbox (top) + Execute & Disconnect Buttons (bottom)
-        right_frame = tk.Frame(self.root, width=150)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=10)
-        right_frame.pack_propagate(False)
-
-        users_group = tk.LabelFrame(right_frame, text="Users")
-        users_group.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-        self.user_listbox = tk.Listbox(users_group, exportselection=False)
-        self.user_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        self.execute_btn = tk.Button(right_frame, text="Execute", height=2, command=self.execute_commands)
-        self.execute_btn.pack(fill=tk.X, pady=(0, 5))
-
-        self.disconnect_btn = tk.Button(right_frame, text="Disconnect", height=2, command=self.disconnect)
-        self.disconnect_btn.pack(fill=tk.X)
-
-    # Temporarly enable editing and add output to text box
-    def write_output(self, text):
-        self.output_area.config(state=tk.NORMAL)
-        self.output_area.insert(tk.END, text + "\n")
-        self.output_area.see(tk.END)
-        self.output_area.config(state=tk.DISABLED)
-
-    # Update user list when updated user list arrives
-    def update_user_list(self):
-        self.user_listbox.delete(0, tk.END)
-        for user in self.user_dict:
-            if user != self.username:
-                self.user_listbox.insert(tk.END, user)
-
-    # Execute function for execute button
-    def execute_commands(self):
-        # Select user from user list
-        selected = self.user_listbox.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a user from the Users list first.")
-            return
-        target_username = self.user_listbox.get(selected[0])
-
-        # Read all lines from the command box
-        raw_text = self.cmd_area.get("1.0", tk.END).strip()
-        if not raw_text:
-            return
-        # Delete readed text from command box
-        self.cmd_area.delete("1.0", tk.END)
-        # For every command, send it to sender function
-        for cmd_line in raw_text.splitlines():
-            cmd_line = cmd_line.strip()
-            if cmd_line:
-                threading.Thread(
-                    target=self.sender, args=(target_username, cmd_line), daemon=True
-                ).start()
-
-    # Start
-    def start(self):
-        # Create Listener Socket for client
-        self.listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.listener_socket.bind(("", 0))
-        self.listener_socket.listen(10)
-        self.listen_port = self.listener_socket.getsockname()[1]
-
-        # Connect to server port
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.connect((self.server_ip, self.server_port))
-        self.user_ip = self.server_socket.getsockname()[0]
-
-        self.server_socket.sendall((json.dumps({
-            "type": "connect",
-            "username": self.username,
-            "ip": self.user_ip,
-            "port": self.listen_port
-        }) + "\n").encode())
-
-        threading.Thread(target=self.client_listener, daemon=True).start()
-        threading.Thread(target=self.server_connect, daemon=True).start()
-        # Start GUI event loop (blocks until window is closed)
-        self.root.mainloop()
-
-    # Server Connector
-    def server_connect(self):
-        self.reader = self.server_socket.makefile("r", encoding="utf-8")
-        for line in reader:
-            msg = json.loads(line)
-            if msg.get("type") == "userlist":
-                # Convert [{"username": u, "ip": ip, "port": p}, ...] -> {u: (ip, p)}
-                self.user_dict = {
-                    u["username"]: (u["ip"], u["port"]) for u in msg["users"]
-                }
-                print(self.user_dict)
-                self.root.after(0, self.update_user_list)
-
-    # Client Listener
-    def client_listener(self):
-        while True:
-            connection, addr = self.listener_socket.accept()
-            data = connection.recv(4096).decode()
-            if data:
-                msg = json.loads(data)
-                if msg["type"] == "msg":
-                    sender = msg["username"]
-                    content = msg["content"]
-                    sender_ip, sender_port = self.user_dict[sender]
-
-                    # Print to GUI output area and log file
-                    self.root.after(0, self.write_output, f"{sender} > {content}")
-                    #self.write_log(f'Message from {sender}@{sender_ip}:{sender_port} "{content}"')
-            connection.close()
-
-    # Sender
-    def sender(self, username, cmd):
-        if " " not in cmd:
-            return
-        send_ip, send_port = self.user_dict[username]
-        send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        send_socket.connect((send_ip, send_port))
-        cmd_type, cmd_content = cmd.split(" ", 1)
-        if cmd_type == "sndmsg":
-            send_socket.sendall(json.dumps({
-                "type": "msg",
-                "username": self.username,
-                "content": cmd_content
-            }).encode())
-            # Print outgoing message to GUI and write to log
-            self.root.after(0, self.write_output, f"{self.username} > {cmd_content}")
-            #self.write_log(f'Message to {username}@{send_ip}:{send_port} "{cmd_content}"')
-        elif cmd_type == "sndf":
-            pass #We are cooked
+def create_peer_listener(local_ip: str) -> socket.socket:
+    """Try randomly selected high ports, binding before announcing the endpoint."""
+    listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        for candidate_port in random.sample(range(49152, 65536), 100):
+            try:
+                listening_socket.bind((local_ip, candidate_port))
+                break
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
         else:
-            pass #NOPE
-        send_socket.close()
+            raise OSError("Could not find an available P2P listening port.")
 
-   # Disconnect
-    def disconnect(self):
-        # Close reader  
-        self.reader.close()
-        # Close listener and server sockets
-        self.server_socket.close()
-        self.listener_socket.close()
-        # Close window
+        listening_socket.listen()
+        return listening_socket
+    except OSError:
+        listening_socket.close()
+        raise
+
+
+class DirectoryConnection:
+    """Network state is separate from the GUI; workers report events via a queue."""
+
+    def __init__(self, username: str, events: queue.Queue) -> None:
+        self.username = username
+        self.events = events
+        self.stopped = threading.Event()
+        self.socket_lock = threading.Lock()
+        self.server_socket: socket.socket | None = None
+        self.listening_socket: socket.socket | None = None
+        self.messenger = PeerMessenger(username, events, self.stopped)
+
+    def connect_and_receive(self, server_ip: str, server_port: int) -> None:
+        try:
+            with socket.create_connection(
+                (server_ip, server_port), timeout=5
+            ) as server_socket:
+                # The outgoing connection tells us which local interface reaches this server.
+                local_ip = server_socket.getsockname()[0]
+                with create_peer_listener(local_ip) as listening_socket:
+                    with self.socket_lock:
+                        if self.stopped.is_set():
+                            return
+                        self.server_socket = server_socket
+                        self.listening_socket = listening_socket
+                        self.messenger.start(listening_socket)
+
+                    send_packet(server_socket, {
+                        "type": "register",
+                        "username": self.username,
+                        "ip": local_ip,
+                        "port": listening_socket.getsockname()[1],
+                    })
+                    # An idle directory connection is normal, not a five-second failure.
+                    server_socket.settimeout(None)
+
+                    while not self.stopped.is_set():
+                        packet = receive_packet(server_socket)
+                        if packet is None:
+                            self.events.put(("info", "Server closed the connection."))
+                            break
+                        if packet.get("type") != "userlist":
+                            raise ValueError("Expected a userlist packet from the server.")
+                        users = packet.get("users")
+                        if not isinstance(users, list):
+                            raise ValueError("The userlist must be a list.")
+                        for user in users:
+                            validate_peer_information(user)
+                        self.events.put(("userlist", users))
+        except (OSError, ValueError) as error:
+            if not self.stopped.is_set():
+                self.events.put(("info", f"Connection error: {error}"))
+        finally:
+            self.close()
+            self.events.put(("disconnected", None))
+
+    def close(self) -> None:
+        """Shutdown wakes a worker blocked in recv; this method can be called twice."""
+        self.stopped.set()
+        with self.socket_lock:
+            connections = (self.server_socket, self.listening_socket)
+            self.server_socket = None
+            self.listening_socket = None
+
+        self.messenger.close()
+        for connection in connections:
+            if connection is not None:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                connection.close()
+
+
+class ClientWindow:
+    def __init__(self, root: tk.Tk, server_ip: str, server_port: int, username: str) -> None:
+        self.root = root
+        self.username = username
+        self.online_users: dict[str, dict] = {}
+        self.events = queue.Queue()
+        self.file_offers = queue.Queue()
+        self.file_dialog_open = False
+        self.connection = DirectoryConnection(username, self.events)
+
+        root.title(f"Peer — {username}")
+        root.geometry("760x500")
+        root.minsize(560, 380)
+        root.protocol("WM_DELETE_WINDOW", self.close_window)
+
+        frame = ttk.Frame(root, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        self.status = tk.StringVar(value=f"Connecting to {server_ip}:{server_port}…")
+        ttk.Label(frame, textvariable=self.status).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
+        )
+        self.output = tk.Text(frame, width=48, height=12, state="disabled", wrap="word")
+        self.output.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+
+        users_frame = ttk.LabelFrame(frame, text="Online users", padding=6)
+        users_frame.grid(row=1, column=1, sticky="nsew")
+        self.user_list = tk.Listbox(users_frame, width=20, exportselection=False)
+        self.user_list.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Commands").grid(
+            row=2, column=0, sticky="w", pady=(10, 4)
+        )
+        self.command_area = tk.Text(frame, height=5, width=48, wrap="word")
+        self.command_area.grid(row=3, column=0, sticky="nsew", padx=(0, 12))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=3, column=1, sticky="nsew")
+        self.execute_button = ttk.Button(
+            buttons, text="Execute", command=self.execute_commands, state="disabled"
+        )
+        self.execute_button.pack(fill="x", pady=(0, 8))
+        self.disconnect_button = ttk.Button(
+            buttons, text="Disconnect", command=self.connection.close
+        )
+        self.disconnect_button.pack(fill="x")
+
+        # Tk stays on the main thread; all blocking network reads use this worker.
+        self.worker = threading.Thread(
+            target=self.connection.connect_and_receive,
+            args=(server_ip, server_port),
+            daemon=True,
+        )
+        self.worker.start()
+        root.after(100, self.process_events)
+
+    def append_output(self, text: str) -> None:
+        self.output.configure(state="normal")
+        self.output.insert("end", text + "\n")
+        self.output.see("end")
+        self.output.configure(state="disabled")
+
+    def execute_commands(self) -> None:
+        selected = self.user_list.curselection()
+        if not selected:
+            self.append_output("Select a recipient from Online users first.")
+            return
+        recipient = self.online_users[self.user_list.get(selected[0])]
+        try:
+            commands = parse_commands(self.command_area.get("1.0", "end-1c"))
+            for command, argument in commands:
+                if command == "sndmsg":
+                    self.connection.messenger.queue_message(recipient, argument)
+                else:
+                    self.connection.messenger.queue_file(recipient, argument)
+        except (OSError, ValueError) as error:
+            self.append_output(str(error))
+            return
+        self.command_area.delete("1.0", "end")
+
+    def confirm_next_file(self) -> None:
+        if self.file_dialog_open or self.connection.stopped.is_set():
+            return
+        try:
+            offer = self.file_offers.get_nowait()
+        except queue.Empty:
+            return
+        self.file_dialog_open = True
+        accepted = False
+        try:
+            accepted = messagebox.askyesno(
+                "Incoming file",
+                f"{offer.sender['username']} wants to send:\n"
+                f"{offer.filename}\n{offer.size:,} bytes\n\nAccept this file?",
+                parent=self.root,
+            )
+        except tk.TclError:
+            # Closing the application while the dialog is open rejects the offer.
+            pass
+        finally:
+            if accepted and not self.connection.stopped.is_set():
+                self.append_output(
+                    f"Accepted {offer.filename} from {offer.sender['username']}."
+                )
+            offer.decision.put(accepted)
+            self.file_dialog_open = False
+
+    def process_events(self) -> None:
+        while True:
+            try:
+                event_type, data = self.events.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_type == "userlist":
+                selected = self.user_list.curselection()
+                selected_username = self.user_list.get(selected[0]) if selected else None
+                self.online_users = {
+                    user["username"]: user for user in data
+                    if user["username"] != self.username
+                }
+                self.user_list.delete(0, "end")
+                for index, username in enumerate(sorted(self.online_users)):
+                    self.user_list.insert("end", username)
+                    if username == selected_username:
+                        self.user_list.selection_set(index)
+                self.status.set(f"Connected as {self.username}")
+                self.execute_button.state(["!disabled"])
+                self.append_output(
+                    f"Userlist updated: {len(self.online_users)} other peer(s) online."
+                )
+            elif event_type == "info":
+                self.append_output(data)
+            elif event_type == "message":
+                peer_username = data["peer"]["username"]
+                if data["direction"] == "to":
+                    label = f"{self.username} → {peer_username}"
+                else:
+                    label = f"{peer_username} → {self.username}"
+                self.append_output(f"{label}: {data['content']}")
+            elif event_type == "file_offer":
+                self.file_offers.put(data)
+            elif event_type == "file":
+                peer_username = data["peer"]["username"]
+                if data["direction"] == "from":
+                    self.append_output(
+                        f"Received {data['filename']} from {peer_username}: {data['destination']}"
+                    )
+                else:
+                    self.append_output(f"Sent {data['filename']} to {peer_username}.")
+            elif event_type == "disconnected":
+                self.status.set("Disconnected")
+                self.online_users.clear()
+                self.user_list.delete(0, "end")
+                self.disconnect_button.state(["disabled"])
+                self.execute_button.state(["disabled"])
+
+        if not self.file_dialog_open and not self.file_offers.empty():
+            self.root.after(0, self.confirm_next_file)
+        self.root.after(100, self.process_events)
+
+    def close_window(self) -> None:
+        self.connection.close()
         self.root.destroy()
 
-# Run client
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("server_ip")
+    parser.add_argument("server_port", type=int)
+    parser.add_argument("username")
+    arguments = parser.parse_args()
+    if not 1 <= arguments.server_port <= 65535:
+        parser.error("server_port must be between 1 and 65535")
+    if not arguments.username.strip():
+        parser.error("username must not be empty")
+
+    root = tk.Tk()
+    ClientWindow(root, arguments.server_ip, arguments.server_port, arguments.username)
+    root.mainloop()
+
+
 if __name__ == "__main__":
-    # Command format: python client.py <server-ip-address> <server-port-number> <user-name>
-    if len(sys.argv) == 4:
-        client = Client(sys.argv[1], sys.argv[2], sys.argv[3])
-        client.start()
-
-
+    main()
